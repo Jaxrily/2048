@@ -1,0 +1,418 @@
+//原作者 https://github.com/skyMetaverse
+//在其基础上改进 
+(function () {
+    const config = {
+        targetScore: 10000, // 目标分数设置为10000
+        moveDelay: 200, // 每次操作的延迟时间（毫秒）
+        pattern: [0, 1, 0, 1, 2, 1], // 操作模式：右、下、左、下、右、下
+        debug: true, // 启用调试日志
+        autoConfirmScore: true, // 启用自动提交分数
+        autoRestart: true, // 启用自动重启
+        maxLogs: 100 // 最大日志数量
+    };
+
+    let gameState = {
+        running: false, // 游戏是否正在运行
+        score: 0, // 当前得分
+        moveCount: 0, // 操作次数
+        patternIndex: 0, // 当前操作模式的索引
+        lastScore: 0, // 上一次记录的得分
+        staleCount: 0, // 得分未变化的次数
+        gameLoopTimer: null, // 游戏循环的定时器
+        cachedElements: {} // 缓存DOM元素
+    };
+
+    const logHistory = []; // 日志历史记录
+    let logCount = 0; // 日志计数
+
+    // 日志函数
+    const log = (...args) => {
+        if (!config.debug) return;
+
+        logCount++;
+        const message = `[2048Bot] ${args.join(' ')}`;
+        console.log(message);
+
+        logHistory.push({
+            time: new Date(),
+            message
+        });
+
+        if (logHistory.length > config.maxLogs) {
+            logHistory.shift(); // 移除最早的日志
+        }
+
+        if (logCount % 100 === 0) {
+            console.clear(); // 每100条日志清空控制台
+            console.log(`[2048Bot] 已清空控制台，总日志数: ${logCount}`);
+            logHistory.forEach(entry => {
+                console.log(`${entry.time.toISOString().substr(11, 8)} ${entry.message}`);
+            });
+        }
+    };
+
+    const DIRECTIONS = ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp']; // 操作方向
+
+    // 模拟按键
+    const simulateKeyPress = (key) => {
+        log(`模拟按键: ${key}`);
+        const event = new KeyboardEvent('keydown', {
+            key: key,
+            code: key,
+            bubbles: true,
+            cancelable: true
+        });
+        document.dispatchEvent(event);
+    };
+
+    // 获取缓存的DOM元素
+    function getCachedElement(key, finder) {
+        if (gameState.cachedElements[key] && document.contains(gameState.cachedElements[key])) {
+            return gameState.cachedElements[key];
+        }
+
+        const element = finder();
+        if (element) {
+            gameState.cachedElements[key] = element;
+        }
+        return element;
+    }
+
+    // 通过文本查找元素
+    function findElementByText(text, exactMatch = false) {
+        const cacheKey = `text_${text}_${exactMatch}`;
+
+        return getCachedElement(cacheKey, () => {
+            let found = null;
+            document.querySelectorAll('div, button').forEach(el => {
+                const elText = el.textContent.trim();
+                if ((exactMatch && elText === text) ||
+                    (!exactMatch && elText.includes(text))) {
+                    found = el;
+                }
+            });
+            return found;
+        });
+    }
+
+    // 查找分数元素
+    function findScoreElement() {
+        return getCachedElement('scoreElement', () => {
+            let scoreElement = null;
+
+            document.querySelectorAll('div').forEach(div => {
+                if (div.textContent === 'SCORE') {
+                    const parent = div.parentElement;
+                    if (parent) {
+                        const numbers = parent.querySelectorAll('div');
+                        for (const el of numbers) {
+                            if (/^\d+$/.test(el.textContent.trim())) {
+                                scoreElement = el;
+                                log(`找到分数元素: ${el.textContent}`);
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
+            if (!scoreElement) {
+                document.querySelectorAll('div').forEach(div => {
+                    const text = div.textContent.trim();
+                    if (/^\d+$/.test(text) && text.length < 6) {
+                        scoreElement = div;
+                    }
+                });
+            }
+
+            return scoreElement;
+        });
+    }
+
+    // 获取当前得分
+    function getCurrentScore() {
+        const scoreElement = findScoreElement();
+        if (!scoreElement) return 0;
+
+        const text = scoreElement.textContent.trim();
+        const score = parseInt(text, 10);
+        return isNaN(score) ? 0 : score;
+    }
+
+    // 清除所有定时器
+    function clearAllTimers() {
+        if (gameState.gameLoopTimer) {
+            clearTimeout(gameState.gameLoopTimer);
+            gameState.gameLoopTimer = null;
+        }
+
+        if (gameState.confirmTimer) {
+            clearTimeout(gameState.confirmTimer);
+            gameState.confirmTimer = null;
+        }
+
+        if (gameState.restartTimer) {
+            clearTimeout(gameState.restartTimer);
+            gameState.restartTimer = null;
+        }
+    }
+
+    // 判断游戏是否结束
+    function isGameOver() {
+        const gameOverElement = findElementByText('Game Over', false);
+        if (gameOverElement) return true;
+
+        const confirmScoreButton = findElementByText('CONFIRM SCORE', true);
+        if (confirmScoreButton) return true;
+
+        const tryAgainButton = findElementByText('Try Again', true);
+        if (tryAgainButton) return true;
+
+        return false;
+    }
+
+    // 处理游戏结束
+    function handleGameOver() {
+        log('检测到游戏结束，正在处理...');
+
+        gameState.running = false;
+        clearAllTimers();
+
+        const currentScore = getCurrentScore();
+        log(`游戏结束，最终得分: ${currentScore}, 最高方块: ${getHighestTile() || '未知'}`);
+        log(`本局游戏总操作次数: ${gameState.moveCount}`);
+        log('游戏结束，暂停5秒...');
+
+        setTimeout(() => {
+            log('5秒暂停结束，继续处理游戏结束');
+
+            if (currentScore >= config.targetScore) {
+                log(`🎉 达到目标分数 ${config.targetScore}! 准备提交分数`);
+
+                if (config.autoConfirmScore) {
+                    const confirmScoreButton = findElementByText('CONFIRM SCORE', true);
+                    if (confirmScoreButton) {
+                        log('点击确认分数按钮 (CONFIRM SCORE)');
+                        confirmScoreButton.click();
+
+                        gameState.confirmTimer = setTimeout(() => {
+                            const confirmButton = findElementByText('Confirm', true);
+                            if (confirmButton) {
+                                log('点击二次确认按钮 (Confirm)');
+                                confirmButton.click();
+
+                                gameState.restartTimer = setTimeout(() => {
+                                    if (config.autoRestart) {
+                                        log('分数提交完成，准备重启游戏');
+                                        restartGame();
+                                    }
+                                }, 2500);
+                            } else {
+                                log('未找到二次确认按钮，尝试继续...');
+                                if (config.autoRestart) {
+                                    restartGame();
+                                }
+                            }
+                        }, 1500);
+
+                        return;
+                    } else {
+                        log('未找到确认分数按钮，尝试其他方法');
+                    }
+                }
+            } else {
+                log(`得分 (${currentScore}) 未达到目标 (${config.targetScore}), 不提交分数，直接重启`);
+                if (config.autoRestart) {
+                    restartGame();
+                }
+            }
+        }, 5000);
+    }
+
+    // 获取最高方块的值
+    function getHighestTile() {
+        try {
+            let highestNumber = 0;
+            document.querySelectorAll('.tile').forEach(tile => {
+                const tileText = tile.textContent.trim();
+                const tileValue = parseInt(tileText, 10);
+                if (!isNaN(tileValue) && tileValue > highestNumber) {
+                    highestNumber = tileValue;
+                }
+            });
+            return highestNumber || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // 按照模式执行操作
+    function moveWithPattern() {
+        const directionIndex = config.pattern[gameState.patternIndex];
+        simulateKeyPress(DIRECTIONS[directionIndex]);
+
+        gameState.patternIndex = (gameState.patternIndex + 1) % config.pattern.length;
+    }
+
+    // 重置游戏状态
+    function resetGameState() {
+        gameState.moveCount = 0;
+        gameState.patternIndex = 0;
+        gameState.staleCount = 0;
+        gameState.lastScore = 0;
+
+        gameState.cachedElements = {};
+    }
+
+    // 重启游戏
+    function restartGame() {
+        log('尝试重启游戏');
+
+        clearAllTimers();
+
+        const newGameButton = findElementByText('New Game', true);
+        if (newGameButton) {
+            newGameButton.click();
+            log('点击新游戏按钮');
+
+            resetGameState();
+
+            gameState.restartTimer = setTimeout(() => {
+                gameState.running = true;
+                startGameLoop();
+                log('游戏循环已重启');
+            }, 2000);
+
+            return true;
+        } else {
+            log('未找到新游戏按钮');
+            return false;
+        }
+    }
+
+    // 启动游戏循环
+    function startGameLoop() {
+        if (gameState.gameLoopTimer) {
+            clearTimeout(gameState.gameLoopTimer);
+        }
+
+        gameLoop();
+    }
+
+    // 游戏循环
+    function gameLoop() {
+        if (!gameState.running) return;
+
+        if (isGameOver()) {
+            handleGameOver();
+            return;
+        }
+
+        try {
+            const currentScore = getCurrentScore();
+
+            if (currentScore !== gameState.lastScore) {
+                log(`当前得分: ${currentScore}, 操作次数: ${gameState.moveCount}`);
+            }
+
+            if (currentScore === gameState.lastScore) {
+                gameState.staleCount++;
+
+                if (gameState.staleCount % 10 === 0) {
+                    log(`得分未变化: ${gameState.staleCount}/40`);
+                }
+
+                if (gameState.staleCount > 40) {
+                    log('游戏可能卡住，执行向上操作以打破僵局');
+                    simulateKeyPress(DIRECTIONS[3]);
+                    gameState.staleCount = 0;
+                }
+            } else {
+                gameState.staleCount = 0;
+            }
+
+            gameState.lastScore = currentScore;
+
+            if (currentScore >= config.targetScore && !gameState.targetReached) {
+                log(`🎉 达到目标分数 ${config.targetScore}! 等待游戏结束`);
+                gameState.targetReached = true;
+            }
+
+            moveWithPattern();
+            gameState.moveCount++;
+
+            gameState.gameLoopTimer = setTimeout(gameLoop, config.moveDelay);
+        } catch (err) {
+            log(`游戏循环错误: ${err.message}`);
+            gameState.gameLoopTimer = setTimeout(gameLoop, config.moveDelay * 2);
+        }
+    }
+
+    // 手动操作
+    function manualMove(directionIndex) {
+        if (directionIndex >= 0 && directionIndex < 4) {
+            simulateKeyPress(DIRECTIONS[directionIndex]);
+            return true;
+        }
+        return false;
+    }
+
+    // 启动机器人
+    function start() {
+        log('启动2048游戏自动化脚本 - 优化版');
+
+        stop();
+
+        resetGameState();
+        gameState.running = true;
+        gameState.targetReached = false;
+
+        startGameLoop();
+    }
+
+    // 停止机器人
+    function stop() {
+        log('停止2048游戏自动化脚本');
+        gameState.running = false;
+        clearAllTimers();
+    }
+
+    // 获取内存使用情况
+    function getMemoryUsage() {
+        if (window.performance && window.performance.memory) {
+            const memory = window.performance.memory;
+            return {
+                totalJSHeapSize: (memory.totalJSHeapSize / (1024 * 1024)).toFixed(2) + ' MB',
+                usedJSHeapSize: (memory.usedJSHeapSize / (1024 * 1024)).toFixed(2) + ' MB',
+                jsHeapSizeLimit: (memory.jsHeapSizeLimit / (1024 * 1024)).toFixed(2) + ' MB'
+            };
+        }
+        return '浏览器不支持内存监控';
+    }
+
+    // 清理资源
+    function cleanup() {
+        stop();
+        gameState.cachedElements = {};
+        while (logHistory.length > 0) logHistory.pop();
+        console.clear();
+        log('清理完成，资源已释放');
+    }
+
+    // 暴露API
+    window.game2048Bot = {
+        start,
+        stop,
+        restart: restartGame,
+        right: () => manualMove(0),
+        down: () => manualMove(1),
+        left: () => manualMove(2),
+        up: () => manualMove(3),
+        config,
+        getMemory: getMemoryUsage,
+        cleanup
+    };
+
+    log('2048游戏脚本已加载。开始自动游戏！');
+    start();
+})();
